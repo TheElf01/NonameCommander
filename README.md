@@ -10,7 +10,7 @@ Build
 
 
 Necesita
-  OpenWatcom 1.9 (connq funcionee wcl, wasm, wlink vale)
+  OpenWatcom 1.9 (connq funcione wcl, wasm, wlink vale)
   DOS 8086 o superior, modo texto VGA
 
 Compilar
