@@ -1,0 +1,4 @@
+; Associated extensions: Enter on the file runs the program
+; %f = file   %d = NC directory
+hoj=%dcells.exe %f
+csv=%dcells.exe %f
