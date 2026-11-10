@@ -1,7 +1,7 @@
 Noname Commander (NC) by theelf
 
 Needs
-  OpenWatcom 1.9 C/C++ (wcl, wasm, wlink)
+  OpenWatcom 1.9 (just working wcl, wasm, wlink)
   DOS 8086 or better, VGA text mode
 
 Build
@@ -10,7 +10,7 @@ Build
 
 
 Necesita
-  OpenWatcom 1.9 C/C++ (wcl, wasm, wlink)
+  OpenWatcom 1.9 (connq funcionee wcl, wasm, wlink vale)
   DOS 8086 o superior, modo texto VGA
 
 Compilar
