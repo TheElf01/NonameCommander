@@ -1,4 +1,16 @@
-
+/*
+ * CELLS - simple spreadsheet for DOS, with the same look as NC
+ * OpenWatcom C89, small model. No printf, no floating point (no emulator
+ * or 8087 needed): numbers are integers with 2 fixed decimals.
+ *
+ * Keys: arrows, PgUp/PgDn, Home, Ctrl+Home, Tab, Enter (down)
+ *   typing = edit cell, F2 = edit contents, Del/F8 = clear cell
+ *   F1 help, F3 open, F4 save as, Ctrl+S save, F5 copy, F6 paste,
+ *   F7 go to cell, F9 decimals, F10 quit, Alt+A / Alt+Z column width,
+ *   Alt+S sum of the cells above (or to the left)
+ * Formulas: =A1+B2*3  (  )  %   SUM(A1:A9)  AVG  MIN  MAX  COUNT
+ * Usage: cells [file.hoj]
+ */
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -58,21 +70,22 @@ static const char *errn[] = { "", "#DIV/0", "#REF", "#SYNT", "#LOOP", "#OVFL" };
 typedef struct {
     char *s;
     long v;
-    unsigned char st, e, k;
+    unsigned char st, e, k;   /* st: 0 dirty 1 calculating 2 ready; k: 0 empty 1 num 2 text 3 formula */
 } CELL;
 
 static CELL sh[NR_][NC_];
 static int cw[NC_];
-static char au[NC_];
+static char au[NC_];             /* 1 = automatic width */
 static int needfit;
-static int cc, cr, tr, lc;
-static int decm = 3;
+static int cc, cr, tr, lc;       /* cursor, top row and column */
+static int decm = 3;             /* 0,1,2 decimals, 3 = auto */
 static int modif;
 static char fname[80];
 static char msg[64];
 static char clip[ELEN + 6];
 static int clipc, clipr, hasclip;
 
+/* ---------------- video ---------------- */
 enum { H_CELL, H_CUR, H_HDR, H_HDRC, H_BAR, H_KEYN, H_KEYL, H_DLG, H_INP, H_BTN, H_BTNF,
        H_ERR, H_ERSH, H_ERRV, H_EDIT, H_STAT, H_LINE, H_SELD, H_LCD, H_LCDD, H_LCDB };
 static unsigned char colc[] = { 0x1F,0x30,0x70,0x8F,0x30,0x07,0x30,0x30,0x0F,0x70,0x2F,0x4F,0x40,0x1C,0x0F,0x2F,0x19,0x0F,0x0A,0x02,0x08 };
@@ -84,15 +97,15 @@ static unsigned short vbuf[2000];
 static unsigned short vsave[2000];
 static int mono, vdirty, sx, sy;
 
-static int formato_V(char *o, const char *f, va_list ap) {
+static int vfmt(char *o, const char *f, va_list ap)
+{
     static const char hx[] = "0123456789ABCDEF";
     char *o0 = o, tmp[12], *p;
     int left, zero, w, prec, lng, n, neg, base;
     unsigned long v;
     long l;
 
-    while (*f)
-    {
+    while (*f) {
         if (*f != '%') { *o++ = *f++; continue; }
         f++;
         left = zero = lng = neg = 0;
@@ -106,8 +119,7 @@ static int formato_V(char *o, const char *f, va_list ap) {
         }
         if (*f == 'l') { lng = 1; f++; }
         p = tmp; n = 0;
-        switch (*f++)
-        {
+        switch (*f++) {
         case 's':
             p = va_arg(ap, char *);
             n = strlen(p);
@@ -122,6 +134,11 @@ static int formato_V(char *o, const char *f, va_list ap) {
             if (l < 0) { neg = 1; v = (unsigned long)(-l); } else v = (unsigned long)l;
             goto num;
         case 'u':
+            v = lng ? va_arg(ap, unsigned long) : (unsigned long)va_arg(ap, unsigned);
+            goto num;
+        case 'x':
+        case 'X':
+            base = 16;
             v = lng ? va_arg(ap, unsigned long) : (unsigned long)va_arg(ap, unsigned);
         num:
             p = tmp + 11; *p = 0;
@@ -144,36 +161,39 @@ static int formato_V(char *o, const char *f, va_list ap) {
     return o - o0;
 }
 
-static int fmt(char *o, const char *f, ...) {
+static int fmt(char *o, const char *f, ...)
+{
     va_list ap;
     int n;
     va_start(ap, f);
-    n = formato_V(o, f, ap);
+    n = vfmt(o, f, ap);
     va_end(ap);
     return n;
 }
 
-static void pos_cursor(int x, int y)
+static void scur(int x, int y)
 {
     union REGS r;
     r.h.ah = 2; r.h.bh = 0; r.h.dh = y; r.h.dl = x;
     int86(0x10, &r, &r);
 }
 
-static void Forma_cursor(int on) {
+static void cshape(int on)
+{
     union REGS r;
     r.h.ah = 1;
     r.x.cx = on ? (mono ? 0x0B0C : 0x0607) : 0x2000;
     int86(0x10, &r, &r);
 }
 
-static void blink(int on) {
+static void blink(int on)
+{
     union REGS r;
     r.x.ax = 0x1003; r.h.bl = (unsigned char)on; r.h.bh = 0;
     int86(0x10, &r, &r);
 }
 
-static void Ini_Video(void)
+static void vinit(void)
 {
     union REGS r;
     r.h.ah = 0x0F;
@@ -199,38 +219,40 @@ static void Ini_Video(void)
     if (!mono) blink(0);
 }
 
-static void Volcar(void)
+static void vflush(void)
 {
     if (!vdirty) return;
     vdirty = 0;
-    if (!mono)
-    {
+    if (!mono) {
         while (inp(0x3DA) & 8) ;
         while (!(inp(0x3DA) & 8)) ;
     }
     _fmemcpy(vreal, (void __far *)vbuf, 4000);
 }
 
-static void Fin_Video(void) {
+static void vend(void)
+{
     _fmemcpy(vreal, (void __far *)vsave, 4000);
     if (!mono) blink(1);
-    Forma_cursor(1);
-    pos_cursor(sx, sy);
+    cshape(1);
+    scur(sx, sy);
 }
 
-static void poner_car(int x, int y, int a, int c) {
+static void vput(int x, int y, int a, int c)
+{
     vdirty = 1;
     vid[y * 80 + x] = ((unsigned)col[a] << 8) | (unsigned char)c;
 }
 
-static void linea_H(int x, int y, int w, int a, int c) {
+static void hline(int x, int y, int w, int a, int c)
+{
     unsigned short __far *p = vid + y * 80 + x;
     unsigned v = ((unsigned)col[a] << 8) | (unsigned char)c;
     vdirty = 1;
     while (w-- > 0) *p++ = v;
 }
 
-static void poner_Txt(int x, int y, int a, const char *s, int w)
+static void vputsn(int x, int y, int a, const char *s, int w)
 {
     unsigned short __far *p = vid + y * 80 + x;
     unsigned at = (unsigned)col[a] << 8;
@@ -239,19 +261,18 @@ static void poner_Txt(int x, int y, int a, const char *s, int w)
     while (w > 0) { *p++ = at | ' '; w--; }
 }
 
-static void Caja(int x, int y, int w, int h, int a, const char *title)
+static void box(int x, int y, int w, int h, int a, const char *title)
 {
     int i;
     char t[70];
-    poner_car(x, y, a, 0xC9); linea_H(x + 1, y, w - 2, a, 0xCD); poner_car(x + w - 1, y, a, 0xBB);
+    vput(x, y, a, 0xC9); hline(x + 1, y, w - 2, a, 0xCD); vput(x + w - 1, y, a, 0xBB);
     for (i = 1; i < h - 1; i++) {
-        poner_car(x, y + i, a, 0xBA); linea_H(x + 1, y + i, w - 2, a, ' '); poner_car(x + w - 1, y + i, a, 0xBA);
+        vput(x, y + i, a, 0xBA); hline(x + 1, y + i, w - 2, a, ' '); vput(x + w - 1, y + i, a, 0xBA);
     }
-    poner_car(x, y + h - 1, a, 0xC8); linea_H(x + 1, y + h - 1, w - 2, a, 0xCD); poner_car(x + w - 1, y + h - 1, a, 0xBC);
-    if (title && *title)
-    {
+    vput(x, y + h - 1, a, 0xC8); hline(x + 1, y + h - 1, w - 2, a, 0xCD); vput(x + w - 1, y + h - 1, a, 0xBC);
+    if (title && *title) {
         i = fmt(t, " %.60s ", title);
-        poner_Txt(x + (w - i) / 2, y, a, t, i);
+        vputsn(x + (w - i) / 2, y, a, t, i);
     }
     vdirty = 1;
     if (x + w + 2 <= 80 && y + h < 24) {
@@ -267,48 +288,50 @@ static void Caja(int x, int y, int w, int h, int a, const char *title)
     }
 }
 
-static void Boton(int x, int y, const char *s, int focus, int sh_) {
+static void buttonx(int x, int y, const char *s, int focus, int sh_)
+{
     int l = strlen(s);
-    poner_Txt(x, y, focus ? H_BTNF : H_BTN, s, l);
-    poner_car(x + l, y, sh_, 0xDC);
-    linea_H(x + 1, y + 1, l, sh_, 0xDF);
+    vputsn(x, y, focus ? H_BTNF : H_BTN, s, l);
+    vput(x + l, y, sh_, 0xDC);
+    hline(x + 1, y + 1, l, sh_, 0xDF);
 }
-#define button(x, y, s, f) Boton(x, y, s, f, H_DLG)
+#define button(x, y, s, f) buttonx(x, y, s, f, H_DLG)
 
-static unsigned Norm_Tecla(unsigned k) {
+/* ---------------- keyboard ---------------- */
+static unsigned normkey(unsigned k)
+{
     if ((k & 0xFF) == 0xE0 && (k >> 8)) k &= 0xFF00;
     else if ((k & 0xFF) == 0) k &= 0xFF00;
     if ((k >> 8) == 0xE0) k = 0x1C00 | (k & 0xFF);
     return k;
 }
 
-static unsigned Leer_Tecla(void)
+static unsigned getkey(void)
 {
-    if (!_bios_keybrd(_KEYBRD_READY)) Volcar();
+    if (!_bios_keybrd(_KEYBRD_READY)) vflush();
     while (!_bios_keybrd(_KEYBRD_READY)) ;
-    return Norm_Tecla(_bios_keybrd(_KEYBRD_READ));
+    return normkey(_bios_keybrd(_KEYBRD_READ));
 }
 
-static int pedir_tecla(const char *title, const char *l1)
+/* ---------------- dialogs ---------------- */
+static int askkey(const char *title, const char *l1)
 {
     int f = 0, c;
     unsigned k;
-    Forma_cursor(0);
-    for (;;)
-    {
-        Caja(10, 9, 60, 6, H_DLG, title);
-        poner_Txt(12, 10, H_DLG, l1, 56);
+    cshape(0);
+    for (;;) {
+        box(10, 9, 60, 6, H_DLG, title);
+        vputsn(12, 10, H_DLG, l1, 56);
         button(21, 12, "  Yes   ", f == 0);
         button(33, 12, "   No   ", f == 1);
         button(45, 12, " Cancel ", f == 2);
-        k = Leer_Tecla();
+        k = getkey();
         c = k & 0xFF;
         if (c == 27) { c = 27; break; }
         if (c == 13) { c = f == 0 ? 'Y' : f == 1 ? 'N' : 27; break; }
         if (k == K_LEFT) f = (f + 2) % 3;
         else if (k == K_RIGHT || c == 9) f = (f + 1) % 3;
-        else
-        {
+        else {
             c = toupper(c);
             if (c == 'Y' || c == 'N') break;
         }
@@ -316,28 +339,30 @@ static int pedir_tecla(const char *title, const char *l1)
     return c;
 }
 
-static void Aviso(const char *title, const char *text) {
-    Caja(10, 9, 60, 6, H_ERR, title);
-    poner_Txt(12, 10, H_ERR, text, 56);
-    Boton(37, 12, "  Ok  ", 1, H_ERSH);
-    Leer_Tecla();
+static void msgbox(const char *title, const char *text)
+{
+    box(10, 9, 60, 6, H_ERR, title);
+    vputsn(12, 10, H_ERR, text, 56);
+    buttonx(37, 12, "  Ok  ", 1, H_ERSH);
+    getkey();
 }
 
-static int pedir_Texto(const char *title, const char *prompt, char *buf, int max) {
+static int inputbox(const char *title, const char *prompt, char *buf, int max)
+{
     int l = strlen(buf), cp = l, off, c;
     unsigned k;
     for (;;) {
-        Caja(10, 9, 60, 7, H_DLG, title);
-        poner_Txt(12, 10, H_DLG, prompt, 56);
+        box(10, 9, 60, 7, H_DLG, title);
+        vputsn(12, 10, H_DLG, prompt, 56);
         off = cp > 53 ? cp - 53 : 0;
-        poner_car(12, 11, H_DLG, '[');
-        poner_Txt(13, 11, H_INP, buf + off, 54);
-        poner_car(67, 11, H_DLG, ']');
+        vput(12, 11, H_DLG, '[');
+        vputsn(13, 11, H_INP, buf + off, 54);
+        vput(67, 11, H_DLG, ']');
         button(23, 13, "  Ok  ", 1);
         button(39, 13, " Cancel ", 0);
-        Forma_cursor(1);
-        pos_cursor(13 + cp - off, 11);
-        k = Leer_Tecla();
+        cshape(1);
+        scur(13 + cp - off, 11);
+        k = getkey();
         c = k & 0xFF;
         if (k == K_LEFT) { if (cp) cp--; }
         else if (k == K_RIGHT) { if (cp < l) cp++; }
@@ -346,8 +371,8 @@ static int pedir_Texto(const char *title, const char *prompt, char *buf, int max
         else if (k == K_DEL) {
             if (cp < l) { memmove(buf + cp, buf + cp + 1, l - cp); l--; }
         }
-        else if (c == 13) { Forma_cursor(0); return 1; }
-        else if (c == 27) { Forma_cursor(0); return 0; }
+        else if (c == 13) { cshape(0); return 1; }
+        else if (c == 27) { cshape(0); return 0; }
         else if (c == 8) {
             if (cp) { memmove(buf + cp - 1, buf + cp, l - cp + 1); cp--; l--; }
         }
@@ -359,9 +384,9 @@ static int pedir_Texto(const char *title, const char *prompt, char *buf, int max
     }
 }
 
-static void Repro_cd(void);
+static void cdplayer(void);
 
-static void Caja_Ayuda(void)
+static void helpbox(void)
 {
     static const char *t[] = {
         "Arrows, PgUp/PgDn, Home, Ctrl+Home : move",
@@ -383,24 +408,25 @@ static void Caja_Ayuda(void)
         "Text: just type. A ' in front forces text."
     };
     int i;
-    Caja(7, 1, 66, 23, H_DLG, "Help");
-    for (i = 0; i < 17; i++) poner_Txt(9, 3 + i, H_DLG, t[i], 62);
-    Leer_Tecla();
+    box(7, 1, 66, 23, H_DLG, "Help");
+    for (i = 0; i < 17; i++) vputsn(9, 3 + i, H_DLG, t[i], 62);
+    getkey();
 }
 
+/* ---------------- sheet: calculation ---------------- */
 static int perr, depth;
 static const char *ip;
 
-static void saltar_Esp(void) { while (*ip == ' ') ip++; }
+static void skipsp(void) { while (*ip == ' ') ip++; }
 
-static long evaluar_Celda(int c, int r);
-static long Expresion(void);
+static long evalcell(int c, int r);
+static long expr(void);
 
-static long Token_Num(int comma) {
+static long numtok(int comma)
+{
     long v = 0, f = 0;
     int n = 0;
-    while (isdigit((unsigned char)*ip))
-    {
+    while (isdigit((unsigned char)*ip)) {
         v = v * 10 + (*ip++ - '0');
         if (v > 20000000L) { perr = E_OVF; v = 0; }
     }
@@ -416,7 +442,8 @@ static long Token_Num(int comma) {
     return v + f;
 }
 
-static int Leer_Ref(int *c, int *r)
+/* ip on a letter: reads A1..Z99. returns 0 if it is not a reference */
+static int refparse(int *c, int *r)
 {
     const char *q = ip;
     int rr = 0;
@@ -432,13 +459,14 @@ static int Leer_Ref(int *c, int *r)
     return 1;
 }
 
-static long Sumar(long a, long b)
+static long addo(long a, long b)
 {
     if (b > 0 ? a > LIM - b : a < -LIM - b) { perr = E_OVF; return 0; }
     return a + b;
 }
 
-static long multiplicar(long a, long b) {
+static long mulo(long a, long b)
+{
     unsigned long ua, ub, ah, al, bh, bl, r;
     int neg = 0;
     if (a < 0) { ua = -a; neg ^= 1; } else ua = a;
@@ -450,7 +478,7 @@ static long multiplicar(long a, long b) {
     return neg ? -(long)r : (long)r;
 }
 
-static long dividir(long a, long b)
+static long divo(long a, long b)
 {
     unsigned long ua, ub, q, rem, fr;
     int neg = 0;
@@ -468,52 +496,52 @@ static long dividir(long a, long b)
 
 typedef struct { long sum, mn, mx; int n, mode; } ACC;
 
-static void acumular(ACC *a, long v)
+static void accum(ACC *a, long v)
 {
-    if (a->mode)
-    {
+    if (a->mode) {
         if (a->n == 0) a->sum = v;
-        else if (a->mode == 1) a->sum = multiplicar(a->sum, v);
-        else if (v != 0) a->sum = dividir(a->sum, v);
+        else if (a->mode == 1) a->sum = mulo(a->sum, v);
+        else if (v != 0) a->sum = divo(a->sum, v);
         a->n++;
         return;
     }
     if (a->n == 0 || v < a->mn) a->mn = v;
     if (a->n == 0 || v > a->mx) a->mx = v;
-    a->sum = Sumar(a->sum, v);
+    a->sum = addo(a->sum, v);
     a->n++;
 }
 
-static long funcion(const char *w) {
+static long func(const char *w)
+{
     ACC a;
     int c1, r1, c2, r2, c, r, t;
     const char *sv;
     long v;
     a.sum = 0; a.mn = 0; a.mx = 0; a.n = 0;
     a.mode = !strcmp(w, "MUL") ? 1 : !strcmp(w, "DIV") ? 2 : 0;
-    ip++;
+    ip++;                       /* ( */
     for (;;) {
-        saltar_Esp();
+        skipsp();
         if (*ip == ')') { ip++; break; }
         sv = ip;
-        if (Leer_Ref(&c1, &r1) && *ip == ':') {
+        if (refparse(&c1, &r1) && *ip == ':') {
             ip++;
-            if (!Leer_Ref(&c2, &r2)) perr = E_SINT;
+            if (!refparse(&c2, &r2)) perr = E_SINT;
             if (perr) break;
             if (c1 > c2) { t = c1; c1 = c2; c2 = t; }
             if (r1 > r2) { t = r1; r1 = r2; r2 = t; }
             for (r = r1; r <= r2 && !perr; r++)
                 for (c = c1; c <= c2 && !perr; c++) {
-                    v = evaluar_Celda(c, r);
-                    if (!perr && (sh[r][c].k == 1 || sh[r][c].k == 3)) acumular(&a, v);
+                    v = evalcell(c, r);
+                    if (!perr && (sh[r][c].k == 1 || sh[r][c].k == 3)) accum(&a, v);
                 }
         } else {
             ip = sv;
-            v = Expresion();
-            if (!perr) acumular(&a, v);
+            v = expr();
+            if (!perr) accum(&a, v);
         }
         if (perr) break;
-        saltar_Esp();
+        skipsp();
         if (*ip == ';' || *ip == ',') { ip++; continue; }
         if (*ip == ')') { ip++; break; }
         perr = E_SINT;
@@ -530,77 +558,76 @@ static long funcion(const char *w) {
     return 0;
 }
 
-static long Valor_simple(void) {
+static long primary(void)
+{
     long v = 0;
     int c, r, n;
     char w[10];
-    saltar_Esp();
+    skipsp();
     if (*ip == '(') {
         ip++;
-        v = Expresion();
-        saltar_Esp();
+        v = expr();
+        skipsp();
         if (*ip == ')') ip++; else perr = E_SINT;
     } else if (isdigit((unsigned char)*ip) || *ip == '.') {
-        v = Token_Num(0);
+        v = numtok(0);
     } else if (isalpha((unsigned char)*ip)) {
-        if (Leer_Ref(&c, &r))
-        {
-            if (!perr) v = evaluar_Celda(c, r);
+        if (refparse(&c, &r)) {
+            if (!perr) v = evalcell(c, r);
         } else {
             n = 0;
-            while (isalpha((unsigned char)*ip))
-            {
+            while (isalpha((unsigned char)*ip)) {
                 if (n < 8) w[n++] = (char)toupper((unsigned char)*ip);
                 ip++;
             }
             w[n] = 0;
-            saltar_Esp();
-            if (*ip == '(') v = funcion(w); else perr = E_SINT;
+            skipsp();
+            if (*ip == '(') v = func(w); else perr = E_SINT;
         }
     } else {
         perr = E_SINT;
     }
-    saltar_Esp();
-    while (*ip == '%' && !perr) { ip++; v /= 100; saltar_Esp(); }
+    skipsp();
+    while (*ip == '%' && !perr) { ip++; v /= 100; skipsp(); }
     return v;
 }
 
-static long Unico_valor(void)
+static long unary(void)
 {
-    saltar_Esp();
-    if (*ip == '-') { ip++; return -Unico_valor(); }
-    if (*ip == '+') { ip++; return Unico_valor(); }
-    return Valor_simple();
+    skipsp();
+    if (*ip == '-') { ip++; return -unary(); }
+    if (*ip == '+') { ip++; return unary(); }
+    return primary();
 }
 
-static long termino(void)
+static long term(void)
 {
-    long a = Unico_valor(), b;
-    for (;;)
-    {
-        saltar_Esp();
+    long a = unary(), b;
+    for (;;) {
+        skipsp();
         if (perr) return 0;
-        if (*ip == '*') { ip++; b = Unico_valor(); a = multiplicar(a, b); }
-        else if (*ip == '/') { ip++; b = Unico_valor(); a = dividir(a, b); }
+        if (*ip == '*') { ip++; b = unary(); a = mulo(a, b); }
+        else if (*ip == '/') { ip++; b = unary(); a = divo(a, b); }
         else break;
     }
     return a;
 }
 
-static long Expresion(void) {
-    long a = termino(), b;
-    for (;;)
-    {
-        saltar_Esp();
+static long expr(void)
+{
+    long a = term(), b;
+    for (;;) {
+        skipsp();
         if (perr) return 0;
-        if (*ip == '+') { ip++; b = termino(); a = Sumar(a, b); }
-        else if (*ip == '-') { ip++; b = termino(); a = Sumar(a, -b); }
+        if (*ip == '+') { ip++; b = term(); a = addo(a, b); }
+        else if (*ip == '-') { ip++; b = term(); a = addo(a, -b); }
         else break;
     }
     return a;
 }
 
-static long evaluar_Celda(int c, int r) {
+static long evalcell(int c, int r)
+{
     CELL *p = &sh[r][c];
     const char *sv, *s;
     int sperr;
@@ -615,20 +642,20 @@ static long evaluar_Celda(int c, int r) {
         else if (*s == '=') {
             p->k = 3;
             ip = s + 1;
-            v = Expresion();
-            saltar_Esp();
+            v = expr();
+            skipsp();
             if (!perr && *ip) perr = E_SINT;
         } else if (*s == '\'') p->k = 2;
         else {
             int neg = 0;
             ip = s;
-            saltar_Esp();
+            skipsp();
             if (*ip == '-') { neg = 1; ip++; } else if (*ip == '+') ip++;
             if (isdigit((unsigned char)*ip) || *ip == '.' || *ip == ',') {
-                v = Token_Num(1);
+                v = numtok(1);
                 if (neg) v = -v;
-                saltar_Esp();
-                if (*ip == '%') { ip++; v /= 100; saltar_Esp(); }
+                skipsp();
+                if (*ip == '%') { ip++; v /= 100; skipsp(); }
                 p->k = (*ip == 0 && !perr) ? 1 : 2;
                 if (p->k == 2) { v = 0; perr = 0; }
             } else p->k = 2;
@@ -643,14 +670,16 @@ static long evaluar_Celda(int c, int r) {
     return p->v;
 }
 
-static void Invalidar(void) {
+static void invalidate(void)
+{
     int r, c;
     for (r = 0; r < NR_; r++)
         for (c = 0; c < NC_; c++) sh[r][c].st = 0;
     needfit = 1;
 }
 
-static void poner_texto(int c, int r, const char *s) {
+static void setraw(int c, int r, const char *s)
+{
     CELL *p = &sh[r][c];
     if (p->s) { free(p->s); p->s = 0; }
     if (s && *s) {
@@ -660,13 +689,14 @@ static void poner_texto(int c, int r, const char *s) {
     }
 }
 
-static void Poner_celda(int c, int r, const char *s) {
-    poner_texto(c, r, s);
+static void setcell(int c, int r, const char *s)
+{
+    setraw(c, r, s);
     modif = 1;
-    Invalidar();
+    invalidate();
 }
 
-static void borrar_todo(void)
+static void clearall(void)
 {
     int r, c;
     for (r = 0; r < NR_; r++)
@@ -680,7 +710,7 @@ static void borrar_todo(void)
     needfit = 1;
 }
 
-static void fmt_numero(char *o, long v)
+static void fmtnum(char *o, long v)
 {
     unsigned long u, i, f;
     int neg = v < 0, dm = decm;
@@ -694,17 +724,16 @@ static void fmt_numero(char *o, long v)
     else if (dm == 2) fmt(o, ".%02d", (int)f);
 }
 
-static void Mover_refs(const char *s, char *d, int dc, int dr)
+/* copies a formula adjusting the references (for pasting) */
+static void adjref(const char *s, char *d, int dc, int dr)
 {
     const char *q;
     int c, r, prev = 0;
-    while (*s)
-    {
+    while (*s) {
         if (isalpha((unsigned char)*s) && !isalnum(prev)) {
             q = s;
             c = toupper((unsigned char)*q) - 'A'; q++;
-            if (isdigit((unsigned char)*q))
-            {
+            if (isdigit((unsigned char)*q)) {
                 r = 0;
                 while (isdigit((unsigned char)*q)) { if (r < 1000) r = r * 10 + (*q - '0'); q++; }
                 if (!isalpha((unsigned char)*q)) {
@@ -723,10 +752,11 @@ static void Mover_refs(const char *s, char *d, int dc, int dr)
     *d = 0;
 }
 
+/* ---------------- files ---------------- */
 static char rb[512], wb[1024];
 static int rpos, rlen, wlen;
 
-static int leer_linea(int fd, char *ln, int max)
+static int getln(int fd, char *ln, int max)
 {
     int n = 0, c;
     for (;;) {
@@ -744,7 +774,7 @@ static int leer_linea(int fd, char *ln, int max)
     return 1;
 }
 
-static int vaciar_esc(int fd)
+static int wflush(int fd)
 {
     int ok = 1;
     if (wlen && write(fd, wb, wlen) != wlen) ok = 0;
@@ -752,9 +782,10 @@ static int vaciar_esc(int fd)
     return ok;
 }
 
-static int escribir_linea(int fd, const char *s) {
+static int putln(int fd, const char *s)
+{
     int l = strlen(s);
-    if (wlen + l + 2 > 1024) if (!vaciar_esc(fd)) return 0;
+    if (wlen + l + 2 > 1024) if (!wflush(fd)) return 0;
     memcpy(wb + wlen, s, l);
     wlen += l;
     wb[wlen++] = '\r';
@@ -762,38 +793,40 @@ static int escribir_linea(int fd, const char *s) {
     return 1;
 }
 
-static int guardar_fich(const char *name) {
+static int savefile(const char *name)
+{
     int fd, r, c, ok = 1;
     char ln[100], t[12];
     fd = open(name, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, S_IREAD | S_IWRITE);
     if (fd < 0) return 0;
     wlen = 0;
-    ok = escribir_linea(fd, "HOJA 1");
+    ok = putln(fd, "HOJA 1");
     fmt(ln, "D %d", decm);
-    ok = ok && escribir_linea(fd, ln);
+    ok = ok && putln(fd, ln);
     strcpy(ln, "W");
     for (c = 0; c < NC_; c++) { fmt(t, " %d", au[c] ? 0 : cw[c]); strcat(ln, t); }
-    ok = ok && escribir_linea(fd, ln);
+    ok = ok && putln(fd, ln);
     for (r = 0; r < NR_ && ok; r++)
         for (c = 0; c < NC_ && ok; c++)
             if (sh[r][c].s) {
                 fmt(ln, "%c%d %.78s", 'A' + c, r + 1, sh[r][c].s);
-                ok = escribir_linea(fd, ln);
+                ok = putln(fd, ln);
             }
-    ok = ok && vaciar_esc(fd);
+    ok = ok && wflush(fd);
     close(fd);
     return ok;
 }
 
-static int Cargar_Fich(const char *name) {
+static int loadfile(const char *name)
+{
     int fd, c, r, n;
     char ln[100];
     const char *q;
     fd = open(name, O_RDONLY | O_BINARY);
     if (fd < 0) return 0;
     rpos = rlen = 0;
-    borrar_todo();
-    while (leer_linea(fd, ln, 100)) {
+    clearall();
+    while (getln(fd, ln, 100)) {
         if (!ln[0] || !strncmp(ln, "HOJA", 4)) continue;
         if (ln[0] == 'D' && ln[1] == ' ') { decm = atoi(ln + 2); if (decm < 0 || decm > 3) decm = 3; continue; }
         if (ln[0] == 'W' && ln[1] == ' ') {
@@ -807,69 +840,72 @@ static int Cargar_Fich(const char *name) {
             continue;
         }
         ip = ln; perr = 0;
-        if (Leer_Ref(&c, &r) && !perr && *ip == ' ') poner_texto(c, r, ip + 1);
+        if (refparse(&c, &r) && !perr && *ip == ' ') setraw(c, r, ip + 1);
         perr = 0;
     }
     close(fd);
     modif = 0;
-    Invalidar();
+    invalidate();
     return 1;
 }
 
-static int Ultima_Vis(int l) {
+/* ---------------- screen ---------------- */
+static int lastvis(int l)
+{
     int x = 3, c = l;
     while (c < NC_ && x + cw[c] <= 80) { x += cw[c]; c++; }
     return c > l ? c - 1 : l;
 }
 
-static void Asegurar_vista(void) {
+static void ensure(void)
+{
     if (cr < tr) tr = cr;
     if (cr >= tr + VROWS) tr = cr - VROWS + 1;
     if (cc < lc) lc = cc;
-    while (cc > Ultima_Vis(lc)) lc++;
+    while (cc > lastvis(lc)) lc++;
 }
 
-static void nombre_ref(char *o, int c, int r)
+static void refname(char *o, int c, int r)
 {
     fmt(o, "%c%d", 'A' + c, r + 1);
 }
 
-static void dib_celda(int x, int y, int w, int c, int r, int cur) {
+static void drawcell(int x, int y, int w, int c, int r, int cur)
+{
     CELL *p = &sh[r][c];
     char t[48], o[48];
     int a = cur ? H_CUR : H_CELL, l, i;
     perr = 0;
-    evaluar_Celda(c, r);
+    evalcell(c, r);
     perr = 0;
     if (p->k == 2) {
-        poner_Txt(x, y, a, (p->s[0] == '\'') ? p->s + 1 : p->s, w);
+        vputsn(x, y, a, (p->s[0] == '\'') ? p->s + 1 : p->s, w);
         return;
     }
-    if (p->k == 0) { poner_Txt(x, y, a, "", w); return; }
-    if (p->e)
-    {
+    if (p->k == 0) { vputsn(x, y, a, "", w); return; }
+    if (p->e) {
         strcpy(t, errn[p->e]);
         if (!cur) a = H_ERRV;
-    } else fmt_numero(t, p->v);
+    } else fmtnum(t, p->v);
     l = strlen(t);
     if (l > w) { for (i = 0; i < w; i++) o[i] = '#'; o[w] = 0; }
     else { memset(o, ' ', w - l); strcpy(o + w - l, t); }
-    poner_Txt(x, y, a, o, w);
+    vputsn(x, y, a, o, w);
 }
 
-static void Dib_Teclas(void)
+static void drawkeys(void)
 {
     static const char *lab[10] = { "Help","Edit","Open","Save","Copy","Paste","Go to","Delete","Decim.","Quit" };
     int i;
     char n[4];
     for (i = 0; i < 10; i++) {
         fmt(n, "%2d", i + 1);
-        poner_Txt(i * 8, 24, H_KEYN, n, 2);
-        poner_Txt(i * 8 + 2, 24, H_KEYL, lab[i], 6);
+        vputsn(i * 8, 24, H_KEYN, n, 2);
+        vputsn(i * 8 + 2, 24, H_KEYL, lab[i], 6);
     }
 }
 
-static void Ajustar_Anchos(void)
+static void fitall(void)
 {
     int c, r, l, m;
     char t[48];
@@ -881,10 +917,10 @@ static void Ajustar_Anchos(void)
         for (r = 0; r < NR_; r++) {
             p = &sh[r][c];
             if (!p->s) continue;
-            perr = 0; evaluar_Celda(c, r); perr = 0;
+            perr = 0; evalcell(c, r); perr = 0;
             if (p->k == 2) l = strlen(p->s) - (p->s[0] == '\'');
             else if (p->e) l = strlen(errn[p->e]);
-            else { fmt_numero(t, p->v); l = strlen(t); }
+            else { fmtnum(t, p->v); l = strlen(t); }
             if (l > m) m = l;
         }
         m++;
@@ -892,89 +928,91 @@ static void Ajustar_Anchos(void)
     }
 }
 
-static void dibujar(void)
+static void draw(void)
 {
     int y, x, c, l, last, w;
     char t[100], o[48];
     CELL *p;
 
-    if (needfit) Ajustar_Anchos();
-    Asegurar_vista();
-    last = Ultima_Vis(lc);
-
-    nombre_ref(t, cc, cr);
+    if (needfit) fitall();
+    ensure();
+    last = lastvis(lc);
+    /* formula bar */
+    refname(t, cc, cr);
     fmt(o, " %-5s", t);
-    poner_Txt(0, 0, H_BAR, o, 7);
+    vputsn(0, 0, H_BAR, o, 7);
     p = &sh[cr][cc];
-    poner_Txt(7, 0, H_CELL, p->s ? p->s : "", 73);
-
-    poner_Txt(0, 1, H_HDR, "", 3);
+    vputsn(7, 0, H_CELL, p->s ? p->s : "", 73);
+    /* column header */
+    vputsn(0, 1, H_HDR, "", 3);
     x = 3;
     for (c = lc; c <= last; c++) {
         w = cw[c];
         memset(o, ' ', w); o[w] = 0;
         o[w / 2] = (char)('A' + c);
-        poner_Txt(x, 1, c == cc ? H_HDRC : H_HDR, o, w);
+        vputsn(x, 1, c == cc ? H_HDRC : H_HDR, o, w);
         x += w;
     }
-    if (x < 80) linea_H(x, 1, 80 - x, H_HDR, ' ');
-
+    if (x < 80) hline(x, 1, 80 - x, H_HDR, ' ');
+    /* rows */
     for (y = 0; y < VROWS; y++) {
         int r = tr + y;
-        if (r >= NR_) { linea_H(0, 2 + y, 80, H_CELL, ' '); continue; }
+        if (r >= NR_) { hline(0, 2 + y, 80, H_CELL, ' '); continue; }
         fmt(t, "%3d", r + 1);
-        poner_Txt(0, 2 + y, r == cr ? H_HDRC : H_HDR, t, 3);
+        vputsn(0, 2 + y, r == cr ? H_HDRC : H_HDR, t, 3);
         x = 3;
         for (c = lc; c <= last; c++) {
-            dib_celda(x, 2 + y, cw[c] - 1, c, r, c == cc && r == cr);
-            poner_car(x + cw[c] - 1, 2 + y, H_LINE, 0xB3);
+            drawcell(x, 2 + y, cw[c] - 1, c, r, c == cc && r == cr);
+            vput(x + cw[c] - 1, 2 + y, H_LINE, 0xB3);
             x += cw[c];
         }
-        if (x < 80) linea_H(x, 2 + y, 80 - x, H_CELL, ' ');
+        if (x < 80) hline(x, 2 + y, 80 - x, H_CELL, ' ');
     }
-
+    /* status line */
     p = &sh[cr][cc];
     perr = 0;
-    evaluar_Celda(cc, cr);
+    evalcell(cc, cr);
     perr = 0;
     l = fmt(t, " %s%s", fname[0] ? fname : "(no name)", modif ? " *" : "");
-    linea_H(0, 23, 80, H_STAT, ' ');
-    poner_Txt(0, 23, H_STAT, t, 30);
-    if (msg[0]) poner_Txt(30, 23, H_STAT, msg, 50);
+    hline(0, 23, 80, H_STAT, ' ');
+    vputsn(0, 23, H_STAT, t, 30);
+    if (msg[0]) vputsn(30, 23, H_STAT, msg, 50);
     else if (p->k == 3 || p->k == 1) {
         if (p->e) fmt(t, "= %s", errn[p->e]);
-        else { strcpy(t, "= "); fmt_numero(t + 2, p->v); }
-        poner_Txt(30, 23, H_STAT, t, 50);
+        else { strcpy(t, "= "); fmtnum(t + 2, p->v); }
+        vputsn(30, 23, H_STAT, t, 50);
     }
-    Dib_Teclas();
+    drawkeys();
 }
 
+/* edits the current cell in the top bar. returns the key that ended it (0 = Esc) */
 static char eb[ELEN + 2];
 
-static unsigned editar_celda(int first) {
+static unsigned editcell(int first)
+{
     int l, cp, off, c, typing = first != 0;
     unsigned k;
     char t[12];
     if (first) { eb[0] = (char)first; eb[1] = 0; }
     else { strcpy(eb, sh[cr][cc].s ? sh[cr][cc].s : ""); }
     l = strlen(eb); cp = l;
-    Forma_cursor(1);
+    cshape(1);
     for (;;) {
-        dibujar();
-        nombre_ref(t, cc, cr);
-        poner_Txt(0, 0, H_BAR, " ", 7);
-        poner_Txt(1, 0, H_BAR, t, 6);
+        draw();
+        refname(t, cc, cr);
+        vputsn(0, 0, H_BAR, " ", 7);
+        vputsn(1, 0, H_BAR, t, 6);
         off = cp > 71 ? cp - 71 : 0;
-        poner_Txt(7, 0, H_EDIT, eb + off, 73);
-        pos_cursor(7 + cp - off, 0);
-        k = Leer_Tecla();
+        vputsn(7, 0, H_EDIT, eb + off, 73);
+        scur(7 + cp - off, 0);
+        k = getkey();
         c = k & 0xFF;
         if (k == K_ENTER || k == K_UP || k == K_DOWN || k == K_TAB || k == K_STAB ||
             (typing && (k == K_LEFT || k == K_RIGHT))) {
-            Forma_cursor(0);
+            cshape(0);
             return k;
         }
-        if (c == 27) { Forma_cursor(0); return 0; }
+        if (c == 27) { cshape(0); return 0; }
         if (k == K_LEFT) { if (cp) cp--; }
         else if (k == K_RIGHT) { if (cp < l) cp++; }
         else if (k == K_HOME) cp = 0;
@@ -993,7 +1031,7 @@ static unsigned editar_celda(int first) {
     }
 }
 
-static void mover(unsigned k)
+static void domove(unsigned k)
 {
     if (k == K_ENTER || k == K_DOWN) { if (cr < NR_ - 1) cr++; }
     else if (k == K_UP) { if (cr) cr--; }
@@ -1001,68 +1039,68 @@ static void mover(unsigned k)
     else if (k == K_LEFT || k == K_STAB) { if (cc) cc--; }
 }
 
-static int celda_Num(int c, int r)
+static int numcell(int c, int r)
 {
     perr = 0;
-    evaluar_Celda(c, r);
+    evalcell(c, r);
     perr = 0;
     return sh[r][c].k == 1 || sh[r][c].k == 3;
 }
 
-static void sumar_auto(const char *fn) {
+static void autoop(const char *fn)
+{
     int r, c, top = -1;
     char t[40], a[8], b[8];
-    for (r = 0; r < cr; r++) if (celda_Num(cc, r)) { top = r; break; }
+    for (r = 0; r < cr; r++) if (numcell(cc, r)) { top = r; break; }
     if (top >= 0) {
-        nombre_ref(a, cc, top); nombre_ref(b, cc, cr - 1);
+        refname(a, cc, top); refname(b, cc, cr - 1);
     } else {
-        for (c = 0; c < cc; c++) if (celda_Num(c, cr)) { top = c; break; }
+        for (c = 0; c < cc; c++) if (numcell(c, cr)) { top = c; break; }
         if (top < 0) { fmt(msg, "Nothing to calculate"); return; }
-        nombre_ref(a, top, cr); nombre_ref(b, cc - 1, cr);
+        refname(a, top, cr); refname(b, cc - 1, cr);
     }
     fmt(t, "=%s(%s:%s)", fn, a, b);
-    Poner_celda(cc, cr, t);
+    setcell(cc, cr, t);
 }
 
-static void Hacer_Porcentaje(void)
+static void dopercent(void)
 {
     char o[12], p[12], t[30];
     o[0] = 0; p[0] = 0;
-    if (!pedir_Texto("Percentage", "Source cell (e.g. B3):", o, 8) || !o[0]) return;
-    if (!pedir_Texto("Percentage", "Percentage (e.g. 20):", p, 8) || !p[0]) return;
+    if (!inputbox("Percentage", "Source cell (e.g. B3):", o, 8) || !o[0]) return;
+    if (!inputbox("Percentage", "Percentage (e.g. 20):", p, 8) || !p[0]) return;
     fmt(t, "=%s*%s%%", o, p);
-    Poner_celda(cc, cr, t);
+    setcell(cc, cr, t);
 }
 
 static char csvsep = ';';
 
-static int es_Csv(const char *n) {
+static int iscsv(const char *n)
+{
     int l = strlen(n);
     return l > 4 && n[l - 4] == '.' && toupper((unsigned char)n[l - 3]) == 'C' &&
            toupper((unsigned char)n[l - 2]) == 'S' && toupper((unsigned char)n[l - 1]) == 'V';
 }
 
-static void poner_campo(int c, int r, char *f, int n)
+static void setfield(int c, int r, char *f, int n)
 {
     char t[ELEN + 4];
     while (n > 0 && f[n - 1] == ' ') n--;
     f[n] = 0;
     if (!n) return;
-    if (f[0] == '=') { t[0] = '\''; strcpy(t + 1, f); poner_texto(c, r, t); }
-    else poner_texto(c, r, f);
+    if (f[0] == '=') { t[0] = '\''; strcpy(t + 1, f); setraw(c, r, t); }
+    else setraw(c, r, f);
 }
 
-static int Cargar_Csv(const char *name, const char *spec)
+static int csvload(const char *name, const char *spec)
 {
     int fd, r = 0, c, n, q, nw = 0, w[NC_], fixed, len, k;
     char ln[200], f[ELEN + 2];
     const char *s, *p;
     fixed = isdigit((unsigned char)spec[0]);
-    if (fixed)
-    {
+    if (fixed) {
         p = spec;
-        while (*p && nw < NC_)
-        {
+        while (*p && nw < NC_) {
             w[nw++] = atoi(p);
             while (isdigit((unsigned char)*p)) p++;
             while (*p && !isdigit((unsigned char)*p)) p++;
@@ -1073,11 +1111,10 @@ static int Cargar_Csv(const char *name, const char *spec)
     fd = open(name, O_RDONLY | O_BINARY);
     if (fd < 0) return 0;
     rpos = rlen = 0;
-    borrar_todo();
-    while (r < NR_ && leer_linea(fd, ln, 200)) {
+    clearall();
+    while (r < NR_ && getln(fd, ln, 200)) {
         s = ln;
-        if (fixed)
-        {
+        if (fixed) {
             len = strlen(ln);
             k = 0;
             for (c = 0; c < nw && c < NC_ && k < len; c++) {
@@ -1087,7 +1124,7 @@ static int Cargar_Csv(const char *name, const char *spec)
                 q = 0;
                 while (q < n && f[q] == ' ') q++;
                 memmove(f, f + q, n - q);
-                poner_campo(c, r, f, n - q);
+                setfield(c, r, f, n - q);
             }
         } else {
             c = 0;
@@ -1108,7 +1145,7 @@ static int Cargar_Csv(const char *name, const char *spec)
                         s++;
                     }
                 }
-                poner_campo(c, r, f, n);
+                setfield(c, r, f, n);
                 c++;
                 if (*s == csvsep) s++; else break;
             }
@@ -1117,20 +1154,20 @@ static int Cargar_Csv(const char *name, const char *spec)
     }
     close(fd);
     modif = 0;
-    Invalidar();
+    invalidate();
     return 1;
 }
 
-static int Escribir_crudo(int fd, const char *s)
+static int putraw(int fd, const char *s)
 {
     int l = strlen(s);
-    if (wlen + l > 1000) if (!vaciar_esc(fd)) return 0;
+    if (wlen + l > 1000) if (!wflush(fd)) return 0;
     memcpy(wb + wlen, s, l);
     wlen += l;
     return 1;
 }
 
-static int guardar_csv(const char *name)
+static int csvsave(const char *name)
 {
     int fd, r, c, maxr = -1, maxc = -1, ok = 1, sd = decm;
     char t[48], sp[2];
@@ -1145,83 +1182,90 @@ static int guardar_csv(const char *name)
     decm = 3;
     for (r = 0; r <= maxr && ok; r++) {
         for (c = 0; c <= maxc && ok; c++) {
-            perr = 0; evaluar_Celda(c, r); perr = 0;
-            if (c) ok = Escribir_crudo(fd, sp);
+            perr = 0; evalcell(c, r); perr = 0;
+            if (c) ok = putraw(fd, sp);
             if (sh[r][c].k == 2) {
                 s = sh[r][c].s[0] == '\'' ? sh[r][c].s + 1 : sh[r][c].s;
-                if (strchr(s, csvsep) || strchr(s, '"'))
-                {
+                if (strchr(s, csvsep) || strchr(s, '"')) {
                     char *d = t;
-                    ok = ok && Escribir_crudo(fd, "\"");
+                    ok = ok && putraw(fd, "\"");
                     while (*s && ok) {
                         d = t;
                         while (*s && d < t + 40) { if (*s == '"') *d++ = '"'; *d++ = *s++; }
                         *d = 0;
-                        ok = Escribir_crudo(fd, t);
+                        ok = putraw(fd, t);
                     }
-                    ok = ok && Escribir_crudo(fd, "\"");
-                } else ok = ok && Escribir_crudo(fd, s);
+                    ok = ok && putraw(fd, "\"");
+                } else ok = ok && putraw(fd, s);
             } else if (sh[r][c].k) {
                 if (sh[r][c].e) strcpy(t, errn[sh[r][c].e]);
                 else {
                     char *d;
-                    fmt_numero(t, sh[r][c].v);
+                    fmtnum(t, sh[r][c].v);
                     if (csvsep == ';') for (d = t; *d; d++) if (*d == '.') *d = ',';
                 }
-                ok = ok && Escribir_crudo(fd, t);
+                ok = ok && putraw(fd, t);
             }
         }
-        ok = ok && Escribir_crudo(fd, "\r\n");
+        ok = ok && putraw(fd, "\r\n");
     }
     decm = sd;
-    ok = ok && vaciar_esc(fd);
+    ok = ok && wflush(fd);
     close(fd);
     return ok;
 }
 
-static int abrir_Fich(const char *name) {
+/* 1 = opened, 0 = error, -1 = cancelled */
+static int openany(const char *name)
+{
     char spec[40];
     int fd;
-    if (!es_Csv(name)) return Cargar_Fich(name);
+    if (!iscsv(name)) return loadfile(name);
     fd = open(name, O_RDONLY | O_BINARY);
     if (fd < 0) return 0;
     close(fd);
     strcpy(spec, ";");
-    if (!pedir_Texto("Open CSV", "Separator (; , tab) or fixed widths (e.g. 10,5,8):", spec, 38)) return -1;
-    return Cargar_Csv(name, spec);
+    if (!inputbox("Open CSV", "Separator (; , tab) or fixed widths (e.g. 10,5,8):", spec, 38)) return -1;
+    return csvload(name, spec);
 }
 
-static void Hacer_Guardar(int ask) {
+static void dosave(int ask)
+{
     char n[80];
-    if (ask || !fname[0])
-    {
+    if (ask || !fname[0]) {
         strcpy(n, fname[0] ? fname : "SHEET1.HOJ");
-        if (!pedir_Texto("Save", "File name:", n, 70)) return;
+        if (!inputbox("Save", "File name:", n, 70)) return;
         if (!n[0]) return;
         strcpy(fname, n);
     }
-    if (es_Csv(fname) ? guardar_csv(fname) : guardar_fich(fname)) { modif = 0; fmt(msg, "Saved"); }
-    else Aviso("Error", "Cannot save file");
+    if (iscsv(fname) ? csvsave(fname) : savefile(fname)) { modif = 0; fmt(msg, "Saved"); }
+    else msgbox("Error", "Cannot save file");
 }
 
-static int hacer_Salir(void)
+static int doexit(void)
 {
     int a;
     if (!modif) return 1;
-    a = pedir_tecla("Quit", "Save changes before quitting?");
+    a = askkey("Quit", "Save changes before quitting?");
     if (a == 27) return 0;
-    if (a == 'Y') { Hacer_Guardar(0); if (modif) return 0; }
+    if (a == 'Y') { dosave(0); if (modif) return 0; }
     return 1;
 }
 
+/* ---------------- CD player (Ctrl+P) ----------------
+ * Uses MSCDEX (INT 2Fh): the drive itself plays the audio and NC only
+ * sends it commands, so the music keeps playing even if you close the window
+ * or run programs. MSCDEX or SHSUCDX must be loaded and the drive
+ * connected with the audio cable to the sound card.
+ */
 #pragma pack(1)
 typedef struct {
     unsigned char len, unit, cmd;
     unsigned status;
     unsigned char res[8];
-    unsigned char media;
-    unsigned long addr;
-    unsigned long num;
+    unsigned char media;        /* ioctl: descriptor; play: 0 = HSG address */
+    unsigned long addr;         /* ioctl: pointer to the block; play: start sector */
+    unsigned long num;          /* ioctl: bytes; play: number of sectors */
     unsigned long vol;
 } CDREQ;
 #pragma pack()
@@ -1236,7 +1280,8 @@ static unsigned long cdend;
 static unsigned long *cdts;
 static unsigned char *cdtc;
 
-static unsigned Cd_Peticion(CDREQ *rq) {
+static unsigned cdreq(CDREQ *rq)
+{
     union REGS r;
     struct SREGS sr;
     segread(&sr);
@@ -1248,7 +1293,8 @@ static unsigned Cd_Peticion(CDREQ *rq) {
     return rq->status;
 }
 
-static unsigned Cd_control(int out, unsigned char *cb, unsigned n)
+/* IOCTL: out=0 reads, out=1 writes; cb is the control block */
+static unsigned cdctl(int out, unsigned char *cb, unsigned n)
 {
     CDREQ rq;
     memset(&rq, 0, sizeof rq);
@@ -1256,31 +1302,36 @@ static unsigned Cd_control(int out, unsigned char *cb, unsigned n)
     rq.cmd = out ? 12 : 3;
     rq.addr = (unsigned long)(void __far *)cb;
     rq.num = n;
-    return Cd_Peticion(&rq);
+    return cdreq(&rq);
 }
 
-static void cd_Simple(int cmd) {
+/* commands without data: 133 = stop/pause, 136 = resume */
+static void cdsimple(int cmd)
+{
     CDREQ rq;
     memset(&rq, 0, sizeof rq);
     rq.len = 13;
     rq.cmd = (unsigned char)cmd;
-    Cd_Peticion(&rq);
+    cdreq(&rq);
 }
 
-static long hsg(const unsigned char *a) {
+static long hsg(const unsigned char *a)
+{
     return ((long)a[2] * 60 + a[1]) * 75 + a[0] - 150;
 }
 
-static int Cd_audio(int t) {
+static int cdaudio(int t)
+{
     return !(cdtc[t] & 0x40);
 }
 
-static int Cd_pistas(void)
+/* reads the disc index; returns the number of tracks or 0 */
+static int cdtoc(void)
 {
     unsigned char cb[8];
     int t;
     cb[0] = 10;
-    if (Cd_control(0, cb, 7) & 0x8000) return 0;
+    if (cdctl(0, cb, 7) & 0x8000) return 0;
     cdfirst = cb[1];
     cdlast = cb[2];
     if (cdfirst < 1 || cdlast > 99 || cdlast < cdfirst) return 0;
@@ -1288,14 +1339,15 @@ static int Cd_pistas(void)
     for (t = cdfirst; t <= cdlast; t++) {
         cb[0] = 11;
         cb[1] = (unsigned char)t;
-        if (Cd_control(0, cb, 7) & 0x8000) return 0;
+        if (cdctl(0, cb, 7) & 0x8000) return 0;
         cdts[t] = hsg(cb + 2);
         cdtc[t] = cb[6];
     }
     return cdlast - cdfirst + 1;
 }
 
-static void Cd_Tocar(int t)
+/* plays from track t to the end of the disc */
+static void cdplay(int t)
 {
     CDREQ rq;
     memset(&rq, 0, sizeof rq);
@@ -1304,44 +1356,51 @@ static void Cd_Tocar(int t)
     rq.media = 0;
     rq.addr = cdts[t];
     rq.num = cdend - cdts[t];
-    Cd_Peticion(&rq);
+    cdreq(&rq);
 }
 
-static void cd_Volumen(void) {
+static void cdsetvol(void)
+{
     unsigned char cb[9];
     cb[0] = 3;
     cb[1] = 0; cb[2] = (unsigned char)cdvol;
     cb[3] = 1; cb[4] = (unsigned char)cdvol;
     cb[5] = 2; cb[6] = 0;
     cb[7] = 3; cb[8] = 0;
-    Cd_control(1, cb, 9);
+    cdctl(1, cb, 9);
 }
 
-static int cd_paso(int d) {
+/* next audio track in direction d */
+static int cdstep(int d)
+{
     int t = cdsel, n = cdntr;
     while (n--) {
         t += d;
         if (t > cdlast) t = cdfirst;
         if (t < cdfirst) t = cdlast;
-        if (Cd_audio(t)) return t;
+        if (cdaudio(t)) return t;
     }
     return cdsel;
 }
 
-static int bcd_Ok(unsigned char b)
+/* the Q subcode comes in BCD in some drivers and in binary in others:
+ * if a value that is not BCD shows up it is converted to binary */
+static int bcdok(unsigned char b)
 {
     return (b >> 4) < 10 && (b & 15) < 10;
 }
 
-static int cd_valor(unsigned char b) {
-    if (!bcd_Ok(b)) { cdbin = 1; return b; }
+static int cdval(unsigned char b)
+{
+    if (!bcdok(b)) { cdbin = 1; return b; }
     return cdbin ? b : (b >> 4) * 10 + (b & 15);
 }
 
-static int cd_Pista(unsigned char b)
+static int cdtrack(unsigned char b)
 {
-
-    int bin = b, bcd = bcd_Ok(b) ? (b >> 4) * 10 + (b & 15) : -1;
+    /* the track number can come in BCD or binary (0x10 = 10 or 16):
+       if both are valid, the one closest to the current track is chosen */
+    int bin = b, bcd = bcdok(b) ? (b >> 4) * 10 + (b & 15) : -1;
     int vb = bin >= cdfirst && bin <= cdlast, vd = bcd >= cdfirst && bcd <= cdlast;
     if (vb && vd && bin != bcd)
         return abs(bin - cdsel) <= abs(bcd - cdsel) ? bin : bcd;
@@ -1350,20 +1409,23 @@ static int cd_Pista(unsigned char b)
     return bin;
 }
 
-static unsigned Cd_Tecla(void)
+/* waits for a key; returns 0 every second to refresh */
+static unsigned cdkey(void)
 {
     unsigned __far *tick = (unsigned __far *)MK_FP(0x40, 0x6C);
     unsigned last = *tick;
-    Volcar();
+    vflush();
     while (!_bios_keybrd(_KEYBRD_READY))
         if (*tick - last >= 18) return 0;
-    return Norm_Tecla(_bios_keybrd(_KEYBRD_READ));
+    return normkey(_bios_keybrd(_KEYBRD_READ));
 }
 
+/* big 3x3 digit with half blocks (DB = full, DF = top, DC = bottom) */
 #define BF "\xDB"
 #define BU "\xDF"
 #define BD "\xDC"
-static void Cd_Grande(int x, int y, int d, int a) {
+static void cdbig(int x, int y, int d, int a)
+{
     static const char *sg[10][3] = {
         { BF BU BF, BF " " BF, BF BD BF },
         { " " BD BF, "  " BF, "  " BF },
@@ -1375,31 +1437,33 @@ static void Cd_Grande(int x, int y, int d, int a) {
         { BU BU BF, "  " BF, "  " BF },
         { BF BU BF, BF BU BF, BF BD BF },
         { BF BU BF, BU BU BF, BD BD BF } };
-    poner_Txt(x, y, a, sg[d][0], 3);
-    poner_Txt(x, y + 1, a, sg[d][1], 3);
-    poner_Txt(x, y + 2, a, sg[d][2], 3);
+    vputsn(x, y, a, sg[d][0], 3);
+    vputsn(x, y + 1, a, sg[d][1], 3);
+    vputsn(x, y + 2, a, sg[d][2], 3);
 }
 
-static void cd_Boton(int x, int y, const char *g, int focus) {
+/* 7-column button with the symbol centered and a shadow */
+static void cdbtn(int x, int y, const char *g, int focus)
+{
     char b[8];
     int l = strlen(g), w = (l & 1) ? 5 : 6, p = (w - l) / 2, i;
     for (i = 0; i < w; i++) b[i] = ' ';
     b[w] = 0;
     memcpy(b + p, g, l);
-    Boton(x, y, b, focus, H_DLG);
+    buttonx(x, y, b, focus, H_DLG);
 }
 
-static void Cd_Cabecera(int x, int y, const char *g)
+static void cdcap(int x, int y, const char *g)
 {
     char b[8];
     int l = strlen(g), p = (7 - l) / 2, i;
     for (i = 0; i < 7; i++) b[i] = ' ';
     b[7] = 0;
     memcpy(b + p, g, l);
-    poner_Txt(x, y, H_DLG, b, 7);
+    vputsn(x, y, H_DLG, b, 7);
 }
 
-static void Repro_cd(void)
+static void cdplayer(void)
 {
     int x = 13, y = 2, w = 54, h = 18, r, c, i, n;
     int lx, blink = 0, dg, mm;
@@ -1423,151 +1487,147 @@ static void Repro_cd(void)
     cdtc = cdtc_s;
     for (r = 0; r <= h; r++)
         for (c = 0; c < w + 2; c++) sv[r * (w + 2) + c] = vid[(y + r) * 80 + x + c];
-    Forma_cursor(0);
-    Caja(x, y, w, h, H_DLG, "CD Player");
+    cshape(0);
+    box(x, y, w, h, H_DLG, "CD Player");
 
     rg.x.ax = 0x1500; rg.x.bx = 0;
     int86(0x2F, &rg, &rg);
     if (rg.x.bx == 0) {
-        poner_Txt(x + 2, y + 1, H_DLG, "MSCDEX is not loaded (CD driver).", w - 4);
-        poner_Txt(x + 2, y + 3, H_DLG, "Load MSCDEX or SHSUCDX and try again.", w - 4);
-        poner_Txt(x + 2, y + 7, H_DLG, "Press a key", w - 4);
-        do k = Cd_Tecla(); while (!k);
+        vputsn(x + 2, y + 1, H_DLG, "MSCDEX is not loaded (CD driver).", w - 4);
+        vputsn(x + 2, y + 3, H_DLG, "Load MSCDEX or SHSUCDX and try again.", w - 4);
+        vputsn(x + 2, y + 7, H_DLG, "Press a key", w - 4);
+        do k = cdkey(); while (!k);
         done = 1;
     } else {
         cddrv = rg.x.cx;
         cdntr = 0;
         cdsel = 0;
         cb[0] = 4;
-        if (!(Cd_control(0, cb, 9) & 0x8000)) cdvol = cb[2];
+        if (!(cdctl(0, cb, 9) & 0x8000)) cdvol = cb[2];
     }
 
-    while (!done)
-    {
-        if (!cdntr)
-        {
-            cdntr = Cd_pistas();
-            if (cdntr)
-            {
-                for (i = cdfirst; i <= cdlast; i++) if (Cd_audio(i)) break;
+    while (!done) {
+        if (!cdntr) {
+            cdntr = cdtoc();
+            if (cdntr) {
+                for (i = cdfirst; i <= cdlast; i++) if (cdaudio(i)) break;
                 cdsel = i > cdlast ? cdfirst : i;
             }
         }
         cb[0] = 15;
-        st = Cd_control(0, cb, 11);
+        st = cdctl(0, cb, 11);
         err = (st & 0x8000) != 0;
         playing = !err && (st & 0x200) != 0;
         paused = !err && !playing && (cb[1] & 1);
-        if (cdntr && (playing || paused))
-        {
+        if (cdntr && (playing || paused)) {
             cb[0] = 12;
-            if (!(Cd_control(0, cb, 11) & 0x8000)) {
-                trk = cd_Pista(cb[2]);
-                mn = cd_valor(cb[4]);
-                sc = cd_valor(cb[5]);
+            if (!(cdctl(0, cb, 11) & 0x8000)) {
+                trk = cdtrack(cb[2]);
+                mn = cdval(cb[4]);
+                sc = cdval(cb[5]);
                 if (hold) hold--;
                 else if (trk >= cdfirst && trk <= cdlast) cdsel = trk;
             }
         }
         blink ^= 1;
         lx = ix + 3;
-
-        for (r = 2; r <= 9; r++) linea_H(ix, y + r - 1, iw, H_LCD, ' ');
-        poner_car(ix, y + 1, H_LCDB, 0xDA); linea_H(ix + 1, y + 1, iw - 2, H_LCDB, 0xC4); poner_car(ix + iw - 1, y + 1, H_LCDB, 0xBF);
-        for (r = 3; r <= 8; r++) { poner_car(ix, y + r - 1, H_LCDB, 0xB3); poner_car(ix + iw - 1, y + r - 1, H_LCDB, 0xB3); }
-        poner_car(ix, y + 8, H_LCDB, 0xC0); linea_H(ix + 1, y + 8, iw - 2, H_LCDB, 0xC4); poner_car(ix + iw - 1, y + 8, H_LCDB, 0xD9);
-        poner_Txt(x + 2, y + 9, H_DLG, "", w - 4);
+        /* black LCD screen */
+        for (r = 2; r <= 9; r++) hline(ix, y + r - 1, iw, H_LCD, ' ');
+        vput(ix, y + 1, H_LCDB, 0xDA); hline(ix + 1, y + 1, iw - 2, H_LCDB, 0xC4); vput(ix + iw - 1, y + 1, H_LCDB, 0xBF);
+        for (r = 3; r <= 8; r++) { vput(ix, y + r - 1, H_LCDB, 0xB3); vput(ix + iw - 1, y + r - 1, H_LCDB, 0xB3); }
+        vput(ix, y + 8, H_LCDB, 0xC0); hline(ix + 1, y + 8, iw - 2, H_LCDB, 0xC4); vput(ix + iw - 1, y + 8, H_LCDB, 0xD9);
+        vputsn(x + 2, y + 9, H_DLG, "", w - 4);
         if (!cdntr) {
-            poner_Txt(lx + 8, y + 3, H_LCD, err ? "NO DISC" : "NOT AUDIO", 14);
-            poner_Txt(lx + 8, y + 5, H_LCDD, "Insert an audio CD", 24);
-            poner_Txt(x + 2, y + 10, H_DLG, "", w - 4);
-            for (r = 12; r <= 14; r++) poner_Txt(x + 2, y + r - 1, H_DLG, "", w - 4);
+            vputsn(lx + 8, y + 3, H_LCD, err ? "NO DISC" : "NOT AUDIO", 14);
+            vputsn(lx + 8, y + 5, H_LCDD, "Insert an audio CD", 24);
+            vputsn(x + 2, y + 10, H_DLG, "", w - 4);
+            for (r = 12; r <= 14; r++) vputsn(x + 2, y + r - 1, H_DLG, "", w - 4);
         } else {
             tot = cdend / 75;
             tl = (int)((cdsel < cdlast ? cdts[cdsel + 1] : cdend) - cdts[cdsel]) / 75;
-            poner_Txt(lx, y + 2, H_LCDD, "TRACK", 5);
-            poner_Txt(lx + 9, y + 2, H_LCDD, "TIME", 6);
-            poner_Txt(lx + 30, y + 2, H_LCDD, "STATUS", 6);
-            Cd_Grande(lx, y + 3, cdsel / 10 % 10, H_LCD);
-            Cd_Grande(lx + 4, y + 3, cdsel % 10, H_LCD);
+            vputsn(lx, y + 2, H_LCDD, "TRACK", 5);
+            vputsn(lx + 9, y + 2, H_LCDD, "TIME", 6);
+            vputsn(lx + 30, y + 2, H_LCDD, "STATUS", 6);
+            cdbig(lx, y + 3, cdsel / 10 % 10, H_LCD);
+            cdbig(lx + 4, y + 3, cdsel % 10, H_LCD);
             mm = (playing || paused) ? mn : 0;
             if (mm > 99) mm = 99;
             dg = (playing || (paused && blink)) ? H_LCD : H_LCDD;
-            Cd_Grande(lx + 9, y + 3, mm / 10, dg);
-            Cd_Grande(lx + 13, y + 3, mm % 10, dg);
-            poner_car(lx + 17, y + 3, dg, 0xFE);
-            poner_car(lx + 17, y + 5, dg, 0xFE);
-            Cd_Grande(lx + 19, y + 3, ((playing || paused) ? sc : 0) / 10 % 10, dg);
-            Cd_Grande(lx + 23, y + 3, ((playing || paused) ? sc : 0) % 10, dg);
+            cdbig(lx + 9, y + 3, mm / 10, dg);
+            cdbig(lx + 13, y + 3, mm % 10, dg);
+            vput(lx + 17, y + 3, dg, 0xFE);
+            vput(lx + 17, y + 5, dg, 0xFE);
+            cdbig(lx + 19, y + 3, ((playing || paused) ? sc : 0) / 10 % 10, dg);
+            cdbig(lx + 23, y + 3, ((playing || paused) ? sc : 0) % 10, dg);
             fmt(t, "%c %s", playing ? 0x10 : paused ? 0xBA : 0xFE,
                 playing ? "PLAYING" : paused ? "PAUSED" : "STOPPED");
-            poner_Txt(lx + 30, y + 3, H_LCD, t, 15);
+            vputsn(lx + 30, y + 3, H_LCD, t, 15);
             fmt(t, "Track %d of %d", cdsel, cdlast);
-            poner_Txt(lx + 30, y + 4, H_LCDD, t, 15);
+            vputsn(lx + 30, y + 4, H_LCDD, t, 15);
             fmt(t, "Disc %d:%02d", (int)(tot / 60), (int)(tot % 60));
-            poner_Txt(lx + 30, y + 5, H_LCDD, t, 15);
-
+            vputsn(lx + 30, y + 5, H_LCDD, t, 15);
+            /* track progress */
             n = 0;
             if ((playing || paused) && tl > 0) n = (mn * 60 + sc) * 44 / tl;
             if (n > 44) n = 44;
-            for (i = 0; i < 44; i++) poner_car(lx + i, y + 7, i < n ? H_LCD : H_LCDD, i < n ? 0xDB : 0xB0);
-
+            for (i = 0; i < 44; i++) vput(lx + i, y + 7, i < n ? H_LCD : H_LCDD, i < n ? 0xDB : 0xB0);
+            /* volume */
             n = cdvol * 30 / 255;
-            poner_Txt(x + 2, y + 10, H_DLG, " Volume", 8);
-            for (i = 0; i < 30; i++) poner_car(x + 10 + i, y + 10, H_DLG, i < n ? 0xDB : 0xB0);
+            vputsn(x + 2, y + 10, H_DLG, " Volume", 8);
+            for (i = 0; i < 30; i++) vput(x + 10 + i, y + 10, H_DLG, i < n ? 0xDB : 0xB0);
             fmt(t, " %3d%%", cdvol * 100 / 255);
-            poner_Txt(x + 40, y + 10, H_DLG, t, w - 42);
-
+            vputsn(x + 40, y + 10, H_DLG, t, w - 42);
+            /* tracks */
             for (i = 0; i < 32; i++) {
                 int tn = i + 1, cx0 = x + 3 + (i % 16) * 3, cy0 = y + 12 + i / 16;
                 if (tn >= cdfirst && tn <= cdlast) {
-                    if (Cd_audio(tn)) fmt(t, " %02d", tn); else strcpy(t, " --");
-                    poner_Txt(cx0, cy0, tn == cdsel ? H_SELD : H_DLG, t, 3);
-                } else poner_Txt(cx0, cy0, H_DLG, "", 3);
+                    if (cdaudio(tn)) fmt(t, " %02d", tn); else strcpy(t, " --");
+                    vputsn(cx0, cy0, tn == cdsel ? H_SELD : H_DLG, t, 3);
+                } else vputsn(cx0, cy0, H_DLG, "", 3);
             }
         }
+        /* buttons */
+        vputsn(x + 2, y + 11, H_DLG, "", w - 4);
+        for (r = 15; r <= 17; r++) vputsn(x + 2, y + r - 1, H_DLG, "", w - 4);
+        cdbtn(x + 3, y + 15, "\x11\x11", 0);
+        cdbtn(x + 11, y + 15, "\x10", playing);
+        cdbtn(x + 19, y + 15, "\xFE\xFE", paused);
+        cdbtn(x + 27, y + 15, "\xFE", cdntr && !playing && !paused);
+        cdbtn(x + 35, y + 15, "\x10\x10", 0);
+        cdbtn(x + 43, y + 15, "\x1E", 0);
 
-        poner_Txt(x + 2, y + 11, H_DLG, "", w - 4);
-        for (r = 15; r <= 17; r++) poner_Txt(x + 2, y + r - 1, H_DLG, "", w - 4);
-        cd_Boton(x + 3, y + 15, "\x11\x11", 0);
-        cd_Boton(x + 11, y + 15, "\x10", playing);
-        cd_Boton(x + 19, y + 15, "\xFE\xFE", paused);
-        cd_Boton(x + 27, y + 15, "\xFE", cdntr && !playing && !paused);
-        cd_Boton(x + 35, y + 15, "\x10\x10", 0);
-        cd_Boton(x + 43, y + 15, "\x1E", 0);
-
-        k = Cd_Tecla();
+        k = cdkey();
         if (!k) continue;
         c = (k & 0xFF) ? toupper(k & 0xFF) : 0;
         if (k == K_ESC) done = 1;
         else if (c == ' ' || c == 'P') {
-            if (playing) cd_Simple(133);
-            else if (paused) cd_Simple(136);
-            else if (cdntr) Cd_Tocar(cdsel);
+            if (playing) cdsimple(133);
+            else if (paused) cdsimple(136);
+            else if (cdntr) cdplay(cdsel);
         } else if (k == K_ENTER) {
-            if (playing || paused) { cd_Simple(133); cd_Simple(133); }
-            else if (cdntr) Cd_Tocar(cdsel);
+            if (playing || paused) { cdsimple(133); cdsimple(133); }
+            else if (cdntr) cdplay(cdsel);
         }
         else if (k == K_LEFT || k == K_RIGHT || k == K_PGUP || k == K_PGDN) {
             if (cdntr) {
-                cdsel = cd_paso((k == K_RIGHT || k == K_PGDN) ? 1 : -1);
-                if (playing || paused) { cd_Simple(133); cd_Simple(133); Cd_Tocar(cdsel); hold = 2; }
+                cdsel = cdstep((k == K_RIGHT || k == K_PGDN) ? 1 : -1);
+                if (playing || paused) { cdsimple(133); cdsimple(133); cdplay(cdsel); hold = 2; }
             }
         } else if (c >= '1' && c <= '9') {
-            if (cdntr && c - '0' >= cdfirst && c - '0' <= cdlast && Cd_audio(c - '0')) {
+            if (cdntr && c - '0' >= cdfirst && c - '0' <= cdlast && cdaudio(c - '0')) {
                 cdsel = c - '0';
-                cd_Simple(133); cd_Simple(133); Cd_Tocar(cdsel); hold = 2;
+                cdsimple(133); cdsimple(133); cdplay(cdsel); hold = 2;
             }
         } else if (k == K_UP || k == K_DOWN || c == '+' || c == '-' || c == '=') {
             cdvol += (k == K_UP || c == '+' || c == '=') ? 16 : -16;
             if (cdvol > 255) cdvol = 255;
             if (cdvol < 0) cdvol = 0;
-            cd_Volumen();
+            cdsetvol();
         } else if (c == 'E') {
-            cb[0] = 0; Cd_control(1, cb, 1);
+            cb[0] = 0; cdctl(1, cb, 1);
             cdntr = 0;
         } else if (c == 'C') {
-            cb[0] = 5; Cd_control(1, cb, 1);
+            cb[0] = 5; cdctl(1, cb, 1);
             cdntr = 0;
         }
     }
@@ -1575,7 +1635,7 @@ static void Repro_cd(void)
     vdirty = 1;
     for (r = 0; r <= h; r++)
         for (c = 0; c < w + 2; c++) vid[(y + r) * 80 + x + c] = sv[r * (w + 2) + c];
-    Volcar();
+    vflush();
     rg.h.ah = 1; rg.x.cx = cx;
     int86(0x10, &rg, &rg);
     rg.h.ah = 2; rg.h.bh = 0; rg.x.dx = dx;
@@ -1583,71 +1643,71 @@ static void Repro_cd(void)
     incd = 0;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv)
+{
     unsigned k;
     int c, r, ok;
     char n[80], t[ELEN + 6];
 
-    borrar_todo();
-    Ini_Video();
-    Forma_cursor(0);
+    clearall();
+    vinit();
+    cshape(0);
     if (argc > 1) {
         strncpy(fname, argv[1], 70);
         fname[70] = 0;
-        dibujar();
-        ok = abrir_Fich(fname);
+        draw();
+        ok = openany(fname);
         if (ok == 0) fmt(msg, "New file");
         else if (ok < 0) fname[0] = 0;
     }
     for (;;) {
-        dibujar();
-        k = Leer_Tecla();
+        draw();
+        k = getkey();
         msg[0] = 0;
         c = k & 0xFF;
         if (k == K_UP || k == K_DOWN || k == K_LEFT || k == K_RIGHT || k == K_TAB || k == K_STAB || k == K_ENTER)
-            mover(k);
+            domove(k);
         else if (k == K_PGUP) { cr -= VROWS; if (cr < 0) cr = 0; tr -= VROWS; if (tr < 0) tr = 0; }
         else if (k == K_PGDN) { cr += VROWS; if (cr >= NR_) cr = NR_ - 1; tr += VROWS; if (tr > NR_ - VROWS) tr = NR_ - VROWS; }
         else if (k == K_HOME) cc = 0;
         else if (k == K_END) { cc = NC_ - 1; }
         else if (k == K_CHOME) { cc = cr = 0; }
-        else if (k == K_DEL || k == K_F8) { if (sh[cr][cc].s) Poner_celda(cc, cr, ""); }
-        else if (k == K_F1) Caja_Ayuda();
+        else if (k == K_DEL || k == K_F8) { if (sh[cr][cc].s) setcell(cc, cr, ""); }
+        else if (k == K_F1) helpbox();
         else if (k == K_F2) {
-            k = editar_celda(0);
-            if (k) { Poner_celda(cc, cr, eb); mover(k); }
+            k = editcell(0);
+            if (k) { setcell(cc, cr, eb); domove(k); }
         }
         else if (k == K_F3) {
-            if (modif && !hacer_Salir()) continue;
+            if (modif && !doexit()) continue;
             strcpy(n, fname);
-            if (pedir_Texto("Open", "File name:", n, 70) && n[0]) {
-                ok = abrir_Fich(n);
+            if (inputbox("Open", "File name:", n, 70) && n[0]) {
+                ok = openany(n);
                 if (ok == 1) { strcpy(fname, n); cc = cr = tr = lc = 0; fmt(msg, "Opened"); }
-                else if (ok == 0) Aviso("Error", "Cannot open file");
+                else if (ok == 0) msgbox("Error", "Cannot open file");
             }
         }
-        else if (k == K_F4) Hacer_Guardar(1);
-        else if (k == K_CTRLS) Hacer_Guardar(0);
-        else if (k == K_CTRLP) Repro_cd();
+        else if (k == K_F4) dosave(1);
+        else if (k == K_CTRLS) dosave(0);
+        else if (k == K_CTRLP) cdplayer();
         else if (k == K_F5) {
             strcpy(clip, sh[cr][cc].s ? sh[cr][cc].s : "");
             clipc = cc; clipr = cr; hasclip = 1;
             fmt(msg, "Copied");
         }
         else if (k == K_F6) {
-            if (hasclip)
-            {
-                if (clip[0] == '=') { Mover_refs(clip, t, cc - clipc, cr - clipr); Poner_celda(cc, cr, t); }
-                else Poner_celda(cc, cr, clip);
+            if (hasclip) {
+                if (clip[0] == '=') { adjref(clip, t, cc - clipc, cr - clipr); setcell(cc, cr, t); }
+                else setcell(cc, cr, clip);
             }
         }
         else if (k == K_F7) {
             n[0] = 0;
-            if (pedir_Texto("Go to", "Cell (e.g. C12):", n, 10) && n[0]) {
+            if (inputbox("Go to", "Cell (e.g. C12):", n, 10) && n[0]) {
                 ip = n; perr = 0;
-                ok = Leer_Ref(&c, &r);
+                ok = refparse(&c, &r);
                 if (ok && !perr) { cc = c; cr = r; }
-                else Aviso("Error", "Invalid cell");
+                else msgbox("Error", "Invalid cell");
                 perr = 0;
             }
         }
@@ -1658,17 +1718,17 @@ int main(int argc, char **argv) {
         }
         else if (k == K_AA) { if (cw[cc] < 30) cw[cc]++; au[cc] = 0; modif = 1; }
         else if (k == K_AZ) { if (cw[cc] > 4) cw[cc]--; au[cc] = 0; modif = 1; }
-        else if (k == K_AS) sumar_auto("SUM");
-        else if (k == K_AM) sumar_auto("MUL");
-        else if (k == K_AD) sumar_auto("DIV");
-        else if (k == K_AP) Hacer_Porcentaje();
-        else if (k == K_F10 || k == K_AX) { if (hacer_Salir()) break; }
-        else if (k == K_ESC) { if (!modif) break; if (hacer_Salir()) break; }
+        else if (k == K_AS) autoop("SUM");
+        else if (k == K_AM) autoop("MUL");
+        else if (k == K_AD) autoop("DIV");
+        else if (k == K_AP) dopercent();
+        else if (k == K_F10 || k == K_AX) { if (doexit()) break; }
+        else if (k == K_ESC) { if (!modif) break; if (doexit()) break; }
         else if (c >= 32) {
-            k = editar_celda(c);
-            if (k) { Poner_celda(cc, cr, eb); mover(k); }
+            k = editcell(c);
+            if (k) { setcell(cc, cr, eb); domove(k); }
         }
     }
-    Fin_Video();
+    vend();
     return 0;
 }

@@ -1,3 +1,10 @@
+; NC.COM - resident loader for NC
+; It stays in memory (~1.3 KB), loads NC.EXE,
+; and when NC exits asking to run something, it runs it and opens NC again.
+; The state is kept here in RAM, nothing is written to disk.
+;
+; wasm -q ncl.asm
+; wlink format dos com file ncl.obj name nc.com option quiet
 
         .8086
 _TEXT   segment word public 'CODE'
@@ -7,28 +14,30 @@ _TEXT   segment word public 'CODE'
 start:  jmp     init
 
         even
-
+; ---- area shared with NC (NC uses it through a far pointer) ----
 shared:
 sig     db      'NCL1'
-run     db      0
-err     db      0
-have    db      0
+run     db      0               ; NC sets 1 if something must be run
+err     db      0               ; EXEC error so NC can show it
+have    db      0               ; 1 if state is valid
         db      0
-prog    db      80 dup (0)
-tail    db      128 dup (0)
-state   db      256 dup (0)
+prog    db      80 dup (0)      ; program path (ASCIIZ)
+tail    db      128 dup (0)     ; parameter line in DOS format
+state   db      256 dup (0)     ; NC state (panels)
 
-ncpath  db      80 dup (0)
+; ---- loader data ----
+ncpath  db      80 dup (0)      ; path of NC.EXE
 nctail  db      13, ' /L:'
 nctseg  db      'SSSS:OOOO', 13
-pblock  dw      0
-        dw      0, 0
-        dw      5Ch, 0
-        dw      6Ch, 0
+pblock  dw      0               ; environment: copy of ours
+        dw      0, 0            ; parameter line (far)
+        dw      5Ch, 0          ; FCB 1 (far)
+        dw      6Ch, 0          ; FCB 2 (far)
 savesp  dw      0
 savess  dw      0
 msgnonc db      'NC: cannot find NC.EXE', 13, 10, '$'
 
+; ---- main loop (resident) ----
 again:
         mov     dx, offset ncpath
         mov     word ptr pblock+2, offset nctail
@@ -37,7 +46,7 @@ again:
         cmp     run, 1
         jne     fin
         mov     run, 0
-
+        ; FCBs for old programs
         push    ds
         pop     es
         mov     si, offset tail+1
@@ -62,6 +71,7 @@ fin:
         mov     ax, 4C00h
         int     21h
 
+; DS:DX = program, pblock already prepared
 doexec:
         push    ds
         push    es
@@ -82,6 +92,8 @@ doexec:
         pop     ds
         ret
 
+; shrinks the memory block to the resident part and goes on (this routine
+; is inside the resident part, the init code is freed here)
 doshrink:
         mov     bx, offset endres
         add     bx, 15
@@ -92,15 +104,16 @@ doshrink:
         jmp     again
 
         even
-pad     db      64 dup (0)
+pad     db      64 dup (0)              ; cushion below the stack
 stk     db      768 dup (0)
 stktop  label   word
 endres  label   byte
 
+; ---- start (this part does not stay resident) ----
 init:
         cld
         mov     sp, offset stktop
-
+        ; find our path at the end of the environment
         mov     es, ds:[2Ch]
         xor     di, di
         xor     al, al
@@ -124,6 +137,7 @@ cpath1:
         or      al, al
         jnz     cpath
 
+        ; CPU: on the 8086 bits 12-15 of flags are always 1
         pushf
         pop     ax
         and     ax, 0FFFh
@@ -146,6 +160,7 @@ cname:
         or      al, al
         jnz     cname
 
+        ; " /L:SSSS:OOOO" with the address of the shared area
         mov     di, offset nctseg
         mov     ax, cs
         call    hex4
@@ -158,6 +173,7 @@ cname:
         mov     word ptr pblock+12, cs
         jmp     doshrink
 
+; AX -> 4 hex digits at DS:DI
 hex4:
         mov     cx, 4
 hex4a:
